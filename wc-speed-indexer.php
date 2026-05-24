@@ -2,7 +2,7 @@
 /**
  * Plugin Name: WC Speed Indexer & Dashboard
  * Description: Database optimization helper with managed indexes, diagnostics, and DB server tuning recommendations for WordPress/WooCommerce sites.
- * Version: 1.5
+ * Version: 1.6
  * Author: Digitalbox.gr
  * Text Domain: wc-speed-indexer
  * Domain Path: /languages
@@ -16,10 +16,11 @@ if (!defined('ABSPATH')) {
     exit;
 }
 
-define('WCSI_VERSION', '1.5');
+define('WCSI_VERSION', '1.6');
 define('WCSI_NOTICE_TRANSIENT', 'wcsi_reindex_notice');
+define('WCSI_ACTIVATION_NOTICE_OPTION', 'wcsi_show_activation_notice');
 
-register_activation_hook(__FILE__, 'wcsi_apply_optimization');
+register_activation_hook(__FILE__, 'wcsi_activate_plugin');
 
 add_action('admin_menu', 'wcsi_create_menu');
 add_action('admin_init', 'wcsi_handle_reindex_action');
@@ -32,6 +33,10 @@ function wcsi_load_textdomain() {
         false,
         dirname(plugin_basename(__FILE__)) . '/languages'
     );
+}
+
+function wcsi_activate_plugin() {
+    update_option(WCSI_ACTIVATION_NOTICE_OPTION, 'yes');
 }
 
 /**
@@ -218,6 +223,29 @@ function wcsi_handle_reindex_action() {
 
     check_admin_referer('wcsi_reindex_action', 'wcsi_reindex_nonce');
 
+    if (empty($_POST['wcsi_confirm_backup'])) {
+        set_transient(
+            WCSI_NOTICE_TRANSIENT,
+            [
+                'added'    => [],
+                'existing' => [],
+                'skipped'  => [],
+                'failed'   => [
+                    __('Index changes were not applied. Confirm that you have a recent database backup before continuing.', 'wc-speed-indexer'),
+                ],
+            ],
+            MINUTE_IN_SECONDS
+        );
+
+        wp_safe_redirect(
+            add_query_arg(
+                ['page' => 'wcsi-dashboard'],
+                admin_url('admin.php')
+            )
+        );
+        exit;
+    }
+
     $result = wcsi_apply_optimization();
     set_transient(WCSI_NOTICE_TRANSIENT, $result, MINUTE_IN_SECONDS);
 
@@ -376,9 +404,152 @@ function wcsi_get_diagnostics() {
         'total_data_length'   => $total_data_length,
         'total_index_length'  => $total_index_length,
         'autoload'            => wcsi_get_autoload_diagnostics(),
+        'woocommerce'         => wcsi_get_woocommerce_diagnostics(),
         'db_server'           => wcsi_get_db_server_diagnostics(),
         'persistent_cache'    => wp_using_ext_object_cache(),
         'savequeries_enabled' => defined('SAVEQUERIES') && SAVEQUERIES,
+    ];
+}
+
+function wcsi_get_woocommerce_diagnostics() {
+    if (!wcsi_is_woocommerce_active()) {
+        return [
+            'active'         => false,
+            'version'        => null,
+            'lookup'         => null,
+            'hpos'           => null,
+            'status_message' => __('WooCommerce is not active. WooCommerce-specific diagnostics are skipped.', 'wc-speed-indexer'),
+        ];
+    }
+
+    return [
+        'active'         => true,
+        'version'        => defined('WC_VERSION') ? WC_VERSION : null,
+        'lookup'         => wcsi_get_product_lookup_table_status(),
+        'hpos'           => wcsi_get_hpos_status(),
+        'status_message' => __('WooCommerce is active.', 'wc-speed-indexer'),
+    ];
+}
+
+function wcsi_is_woocommerce_active() {
+    return class_exists('WooCommerce') || function_exists('WC') || defined('WC_VERSION');
+}
+
+function wcsi_get_product_lookup_table_status() {
+    global $wpdb;
+
+    $lookup_table = $wpdb->prefix . 'wc_product_meta_lookup';
+    if (!wcsi_table_exists($lookup_table)) {
+        return [
+            'exists'          => false,
+            'product_count'   => null,
+            'lookup_count'    => null,
+            'pending_actions' => null,
+            'level'           => 'warning',
+            'message'         => __('WooCommerce product lookup table is missing.', 'wc-speed-indexer'),
+        ];
+    }
+
+    $quoted_lookup_table = wcsi_quote_identifier($lookup_table);
+    if (is_wp_error($quoted_lookup_table)) {
+        return [
+            'exists'          => true,
+            'product_count'   => null,
+            'lookup_count'    => null,
+            'pending_actions' => null,
+            'level'           => 'warning',
+            'message'         => $quoted_lookup_table->get_error_message(),
+        ];
+    }
+
+    $product_count = (int) $wpdb->get_var(
+        $wpdb->prepare(
+            "SELECT COUNT(ID) FROM {$wpdb->posts} WHERE post_type IN (%s, %s) AND post_status NOT IN (%s, %s)",
+            'product',
+            'product_variation',
+            'trash',
+            'auto-draft'
+        )
+    );
+    $lookup_count = (int) $wpdb->get_var("SELECT COUNT(product_id) FROM {$quoted_lookup_table}");
+    $pending      = wcsi_get_pending_lookup_update_count();
+
+    if ($pending > 0) {
+        return [
+            'exists'          => true,
+            'product_count'   => $product_count,
+            'lookup_count'    => $lookup_count,
+            'pending_actions' => $pending,
+            'level'           => 'warning',
+            'message'         => __('Product lookup table updates appear to be queued or running.', 'wc-speed-indexer'),
+        ];
+    }
+
+    if ($product_count > 0 && $lookup_count < $product_count) {
+        return [
+            'exists'          => true,
+            'product_count'   => $product_count,
+            'lookup_count'    => $lookup_count,
+            'pending_actions' => $pending,
+            'level'           => 'warning',
+            'message'         => __('Product lookup table may be incomplete. Regenerate it from WooCommerce tools.', 'wc-speed-indexer'),
+        ];
+    }
+
+    return [
+        'exists'          => true,
+        'product_count'   => $product_count,
+        'lookup_count'    => $lookup_count,
+        'pending_actions' => $pending,
+        'level'           => 'good',
+        'message'         => __('Product lookup table looks up to date based on row counts.', 'wc-speed-indexer'),
+    ];
+}
+
+function wcsi_get_pending_lookup_update_count() {
+    if (!function_exists('as_get_scheduled_actions')) {
+        return 0;
+    }
+
+    $hooks = [
+        'wc_update_product_lookup_tables',
+        'wc_update_product_lookup_tables_column',
+    ];
+    $count = 0;
+
+    foreach ($hooks as $hook) {
+        $actions = as_get_scheduled_actions(
+            [
+                'hook'     => $hook,
+                'status'   => 'pending',
+                'per_page' => 100,
+            ],
+            'ids'
+        );
+
+        if (is_array($actions)) {
+            $count += count($actions);
+        }
+    }
+
+    return $count;
+}
+
+function wcsi_get_hpos_status() {
+    if (class_exists('\Automattic\WooCommerce\Utilities\OrderUtil') && method_exists('\Automattic\WooCommerce\Utilities\OrderUtil', 'custom_orders_table_usage_is_enabled')) {
+        return [
+            'available' => true,
+            'enabled'   => \Automattic\WooCommerce\Utilities\OrderUtil::custom_orders_table_usage_is_enabled(),
+            'source'    => 'OrderUtil::custom_orders_table_usage_is_enabled',
+        ];
+    }
+
+    $enabled = 'yes' === get_option('woocommerce_custom_orders_table_enabled', 'no');
+
+    return [
+        'available' => false,
+        'enabled'   => $enabled,
+        'source'    => 'woocommerce_custom_orders_table_enabled option',
     ];
 }
 
@@ -805,6 +976,11 @@ function wcsi_render_admin_notice() {
         return;
     }
 
+    if ('yes' === get_option(WCSI_ACTIVATION_NOTICE_OPTION)) {
+        delete_option(WCSI_ACTIVATION_NOTICE_OPTION);
+        echo '<div class="notice notice-warning is-dismissible"><p>' . esc_html__('WC Speed Indexer is active. Managed indexes are not changed automatically on activation. Review the diagnostics, take a database backup, then confirm the manual recheck/apply action if you want to apply missing indexes.', 'wc-speed-indexer') . '</p></div>';
+    }
+
     $notice = get_transient(WCSI_NOTICE_TRANSIENT);
     if (!$notice || !is_array($notice)) {
         return;
@@ -907,6 +1083,8 @@ function wcsi_render_diagnostics_panel(array $diagnostics) {
         </div>
     </div>
 
+    <?php wcsi_render_woocommerce_diagnostics_panel($diagnostics['woocommerce']); ?>
+
     <table class="wp-list-table widefat fixed striped" style="margin-bottom:20px;">
         <thead>
             <tr>
@@ -958,6 +1136,65 @@ function wcsi_render_diagnostics_panel(array $diagnostics) {
     <?php endif; ?>
 
     <?php wcsi_render_db_server_tuning_panel($diagnostics['db_server']); ?>
+    <?php
+}
+
+function wcsi_render_woocommerce_diagnostics_panel(array $woocommerce) {
+    ?>
+    <h2><?php echo esc_html__('WooCommerce Diagnostics', 'wc-speed-indexer'); ?></h2>
+
+    <?php if (empty($woocommerce['active'])) : ?>
+        <div class="notice notice-info inline" style="margin:12px 0;">
+            <p><?php echo esc_html($woocommerce['status_message']); ?></p>
+        </div>
+        <?php
+        return;
+    endif;
+
+    $lookup = $woocommerce['lookup'];
+    $hpos   = $woocommerce['hpos'];
+    ?>
+
+    <table class="widefat striped" style="margin-bottom:20px;">
+        <tbody>
+            <tr>
+                <th scope="row"><?php echo esc_html__('WooCommerce', 'wc-speed-indexer'); ?></th>
+                <td>
+                    <?php echo esc_html__('Active', 'wc-speed-indexer'); ?>
+                    <?php if (!empty($woocommerce['version'])) : ?>
+                        <?php echo esc_html(' ' . $woocommerce['version']); ?>
+                    <?php endif; ?>
+                </td>
+            </tr>
+            <tr>
+                <th scope="row"><?php echo esc_html__('Product lookup table', 'wc-speed-indexer'); ?></th>
+                <td style="color:<?php echo esc_attr(wcsi_get_level_color($lookup['level'])); ?>;">
+                    <?php echo esc_html($lookup['message']); ?>
+                    <?php if ($lookup['exists']) : ?>
+                        <br>
+                        <small>
+                            <?php
+                            printf(
+                                /* translators: 1: product count, 2: lookup row count, 3: pending action count. */
+                                esc_html__('Products: %1$s | Lookup rows: %2$s | Pending lookup actions: %3$s', 'wc-speed-indexer'),
+                                esc_html(number_format_i18n((int) $lookup['product_count'])),
+                                esc_html(number_format_i18n((int) $lookup['lookup_count'])),
+                                esc_html(number_format_i18n((int) $lookup['pending_actions']))
+                            );
+                            ?>
+                        </small>
+                    <?php endif; ?>
+                </td>
+            </tr>
+            <tr>
+                <th scope="row"><?php echo esc_html__('HPOS', 'wc-speed-indexer'); ?></th>
+                <td style="color:<?php echo $hpos['enabled'] ? '#008a20' : '#646970'; ?>;">
+                    <?php echo $hpos['enabled'] ? esc_html__('Enabled', 'wc-speed-indexer') : esc_html__('Not enabled', 'wc-speed-indexer'); ?>
+                    <br><small><?php echo esc_html($hpos['source']); ?></small>
+                </td>
+            </tr>
+        </tbody>
+    </table>
     <?php
 }
 
@@ -1255,6 +1492,18 @@ function wcsi_dashboard_page() {
         <div style="margin-top:20px;">
             <form method="post" action="<?php echo esc_url(admin_url('admin.php?page=wcsi-dashboard')); ?>">
                 <?php wp_nonce_field('wcsi_reindex_action', 'wcsi_reindex_nonce'); ?>
+                <div class="notice notice-warning inline" style="margin:0 0 12px 0;">
+                    <p>
+                        <strong><?php echo esc_html__('Backup recommended:', 'wc-speed-indexer'); ?></strong>
+                        <?php echo esc_html__('Applying missing indexes changes the database schema. Take a recent database backup and, for large WooCommerce stores, consider running this during a low-traffic window.', 'wc-speed-indexer'); ?>
+                    </p>
+                </div>
+                <p>
+                    <label>
+                        <input type="checkbox" name="wcsi_confirm_backup" value="1" required>
+                        <?php echo esc_html__('I confirm that I have a recent database backup and understand that this action may alter database indexes.', 'wc-speed-indexer'); ?>
+                    </label>
+                </p>
                 <input type="submit" name="wcsi_reindex" class="button button-primary" value="<?php echo esc_attr__('Recheck / Apply Indexes', 'wc-speed-indexer'); ?>">
             </form>
         </div>

@@ -17,9 +17,15 @@ The plugin is designed for WooCommerce stores and larger WordPress sites where s
 - Provides a manual recheck/apply indexes button.
 - Shows admin notices for success or failure.
 - Shows read-only diagnostics for managed tables, missing indexes, autoloaded options, object cache, and DB server tuning.
+- Shows WooCommerce-specific diagnostics when WooCommerce is active:
+  - product lookup table status,
+  - product count vs lookup table row count,
+  - pending product lookup update actions,
+  - HPOS status.
 - Safely skips optional WooCommerce/HPOS tables when they do not exist.
 - Stores the last successful optimization timestamp in the `wcsi_last_optimization` option.
 - Uses the `wc-speed-indexer` text domain and is ready for translation files under `/languages`.
+- Does not apply index changes automatically on activation. Manual index changes require an explicit backup confirmation checkbox.
 
 ## Diagnostics
 
@@ -39,6 +45,8 @@ It shows:
 - best-effort CPU/RAM detection when the hosting environment allows it,
 - a suggested hardware tuning profile when CPU/RAM can be detected,
 - hardware tuning profiles for 2/4/8/16 core setups.
+- WooCommerce product lookup table status when WooCommerce is active,
+- HPOS status when WooCommerce is active.
 
 Diagnostics do not change the database and do not replace a slow query log, Query Monitor, or hosting-level database monitoring. They are intended to show where to look first.
 
@@ -99,19 +107,21 @@ The real table prefix is read from `$wpdb`, so the site does not need to use the
 
 ## Usage
 
-When the plugin is activated, it attempts to apply the managed indexes automatically.
+When the plugin is activated, it does not apply index changes automatically. Open the dashboard, review the diagnostics, take a database backup, then manually confirm the index recheck/apply action.
 
 To manually recheck indexes:
 
 1. Open the WordPress admin.
 2. Go to **DB Indexer**.
-3. Click **Recheck / Apply Indexes**.
+3. Confirm that you have a recent database backup.
+4. Click **Recheck / Apply Indexes**.
 
 ## Important Notes
 
 - Take a full database backup before using this on a production site.
 - On large WooCommerce stores, creating indexes can take time and temporarily increase database load.
 - Test first on a staging environment when possible.
+- Index changes require manual confirmation from the dashboard.
 - The plugin does not remove indexes on deactivation.
 - The plugin does not perform full query profiling. It checks for specific managed indexes and read-only diagnostics.
 - Optional WooCommerce/HPOS indexes are applied only when the corresponding tables already exist.
@@ -164,6 +174,14 @@ wp i18n make-pot . languages/wc-speed-indexer.pot
 ```
 
 ## Changelog
+
+### 1.6
+
+- Added WooCommerce product lookup table diagnostics.
+- Added HPOS status diagnostics when WooCommerce is active.
+- Stopped applying index changes automatically on plugin activation.
+- Added a backup warning and required confirmation checkbox before manual index changes.
+- Added an activation notice explaining the manual review/apply flow.
 
 ### 1.5
 
